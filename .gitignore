@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# watcher 自己产生的运行态文件（真实运行时位于目标项目的 .claude/watching/）
+*.log
+stream_logs/
+last_session_id.txt

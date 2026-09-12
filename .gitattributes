@@ -1,0 +1,5 @@
+# 统一以 LF 存储，避免 Windows 上整文件行尾翻转造成的无意义 diff
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary
