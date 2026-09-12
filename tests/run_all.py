@@ -16,6 +16,24 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 
 
+def configure_stdout() -> None:
+    """把 stdout / stderr 固定为 UTF-8。
+
+    理由与 claude_watcher.configure_stdout 相同：Windows 上 stdout 可能是
+    cp1252 之类的 ANSI 代码页，打印用例输出里的中文会抛 UnicodeEncodeError。
+    运行器由系统 Python 直接执行、不经过被测模块，所以必须自己设一次
+    （CI 上 Windows 曾因此整个 job 失败）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+configure_stdout()
+
+
 def discover():
     return sorted(p.stem for p in TESTS_DIR.glob("case_*.py"))
 

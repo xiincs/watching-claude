@@ -22,6 +22,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+
+def configure_stdout() -> None:
+    """把 stdout / stderr 固定为 UTF-8。
+
+    用例自己会打印中文。被测模块在 import 时也会做同样的事，但那是
+    load() 之后才发生的，且 CW_MODULE 可以指向任意旧版本——夹具不能
+    依赖被测对象的这个行为，所以自己设一次。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+configure_stdout()
+
 MODULE = Path(
     os.environ.get("CW_MODULE") or (REPO_ROOT / "claude_watcher.py")
 ).resolve()
