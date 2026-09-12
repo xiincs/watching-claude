@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,53 +22,347 @@ from openai import OpenAI
 # 配置
 # ============================================================
 
-PROJECT_DIR = Path(r"E:\Project202608\dsh-desktop")
+# 状态文件统一放在目标项目的这个子目录下（与 Claude Code 的约定一致）。
+WATCHING_SUBDIR = Path(".claude") / "watching"
 
-TASK_PROMPT_FILE = (
-    PROJECT_DIR
-    / ".claude"
-    / "watching"
-    / "task_prompt_20260911_01.md"
-)
+# 任务 prompt 的自动发现规则：
+#   1. 显式固定名（不带日期）优先，用于把当前任务“钉住”
+#   2. 否则取 task_prompt*.md 中字典序最大的一个
+#      文件名形如 task_prompt_20260911_01.md，字典序即时间序，
+#      因此“换任务”只需要新建一个文件，不必改代码
+PINNED_TASK_NAME = "task_prompt.md"
+TASK_GLOB = "task_prompt*.md"
 
-WATCHING_DIR = PROJECT_DIR / ".claude" / "watching"
-SESSION_FILE = WATCHING_DIR / "last_session_id.txt"
-STREAM_LOG_DIR = WATCHING_DIR / "stream_logs"
-WATCHER_LOG_FILE = WATCHING_DIR / "watcher.log"
+# 环境变量（配置优先级：命令行 > 环境变量 > 默认值）
+ENV_PROJECT = "WATCHER_PROJECT_DIR"
+ENV_TASK = "WATCHER_TASK_PROMPT"
+ENV_MODEL = "WATCHER_MODEL"
 
-# Claude CLI
-CLAUDE_COMMAND = "claude"
-CLAUDE_MAX_TURNS = 50
 
-# Claude 无事件 watchdog
-IDLE_WARNING_SECONDS = 180
-IDLE_KILL_SECONDS = 600
+@dataclass(frozen=True)
+class Config:
+    """一次运行所需的全部配置。
 
-# 失败重试
-BASE_DELAY = 10
-MAX_DELAY = 300
-BACKOFF_FACTOR = 2
-JITTER = 0.3
+    设计要点：
+    - 路径只由 project_dir 派生（见下方 property），切换目标项目只改一个值
+    - 不在 import 时读磁盘：全部解析发生在 resolve_config()
+    - frozen：运行中途不会被意外改写
+    """
 
-# 同一个 session 连续失败达到该次数，即判定 session 不可用并丢弃重开。
-#
-# 网络中断 / watchdog 强杀时 Claude 可能来不及输出 result 事件，
-# 此时 session_invalid 永远不会被置位，必须靠这个计数兜底恢复。
-#
-# 取值权衡：丢弃 session 会连带丢掉 Claude 对仓库的积累认知，下一轮
-# 需要重新摸索，因此不宜过于激进——纯粹的链路抖动并不会损坏 session。
-# 按退避序列（10/20/40/80/160/300...）估算，8 次约等于连续故障 20 分钟
-# 才会丢弃；这既能覆盖长时间断网，又能对真正损坏的 session 兜底。
-MAX_CONSECUTIVE_FAILURES = 8
+    project_dir: Path
+    task_prompt_file: Path
 
-# 连续多少轮目标仓库 git 状态毫无变化，就判定为“原地打转”。
-# 注意：命中后只升级 prompt 做自诊断，绝不停止循环。
-STUCK_ROUNDS = 3
+    # Claude CLI
+    claude_command: str = "claude"
+    claude_max_turns: int = 50
 
-# DeepSeek
-DEEPSEEK_MODEL = "deepseek-flash"
-DEEPSEEK_TIMEOUT = 120
-DEEPSEEK_MIN_CONFIDENCE = 0.90
+    # Claude 无事件 watchdog（网络卡死时的解套手段）
+    idle_warning_seconds: int = 180
+    idle_kill_seconds: int = 600
+
+    # 失败退避
+    base_delay: float = 10
+    max_delay: float = 300
+    backoff_factor: float = 2
+    jitter: float = 0.3
+
+    # 同一 session 连续失败达到该次数，即判定 session 不可用并丢弃重开。
+    #
+    # 网络中断 / watchdog 强杀时 Claude 可能来不及输出 result 事件，
+    # 此时 session_invalid 永远不会被置位，必须靠这个计数兜底恢复。
+    #
+    # 取值权衡：丢弃 session 会连带丢掉 Claude 对仓库的积累认知，下一轮
+    # 需要重新摸索，因此不宜过于激进——纯粹的链路抖动并不会损坏 session。
+    # 按退避序列（10/20/40/80/160/300...）估算，8 次约等于连续故障 20 分钟
+    # 才会丢弃；这既能覆盖长时间断网，又能对真正损坏的 session 兜底。
+    max_consecutive_failures: int = 8
+
+    # 连续多少轮目标仓库 git 状态毫无变化，就判定为“原地打转”。
+    # 注意：命中后只升级 prompt 做自诊断，绝不停止循环。
+    stuck_rounds: int = 3
+
+    # DeepSeek
+    deepseek_model: str = "deepseek-flash"
+    deepseek_timeout: int = 120
+    deepseek_min_confidence: float = 0.90
+
+    # ---------------- 派生路径：状态文件位置只在这里定义一次 ----------------
+
+    @property
+    def watching_dir(self) -> Path:
+        return self.project_dir / WATCHING_SUBDIR
+
+    @property
+    def session_file(self) -> Path:
+        return self.watching_dir / "last_session_id.txt"
+
+    @property
+    def stream_log_dir(self) -> Path:
+        return self.watching_dir / "stream_logs"
+
+    @property
+    def watcher_log_file(self) -> Path:
+        return self.watching_dir / "watcher.log"
+
+
+# 当前生效配置。main() 解析完成后写入，辅助函数读取。
+# 允许为 None，是为了让 log() 等在配置建立之前（--list-tasks、解析失败、
+# --help）也能安全工作。
+CONFIG: Optional[Config] = None
+
+
+class ConfigError(Exception):
+    """配置无法解析：目录不存在、找不到任务文件等。"""
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name,
+        description="Claude Code 外部监工：自动续跑 + DeepSeek 验收",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "配置优先级：命令行 > 环境变量 > 默认值\n"
+            f"  {ENV_PROJECT}   目标项目目录（等价于 --project）\n"
+            f"  {ENV_TASK}      任务 prompt 文件（等价于 --task）\n"
+            f"  {ENV_MODEL}     DeepSeek 模型（等价于 --model）\n"
+            "  DEEPSEEK_API_KEY   DeepSeek 鉴权，必填\n"
+            "\n"
+            "默认行为：目标项目取当前工作目录；任务 prompt 自动取\n"
+            f"  <project>/{WATCHING_SUBDIR.as_posix()}/{TASK_GLOB} 中字典序最大者，\n"
+            f"  若存在 {PINNED_TASK_NAME} 则优先使用它。\n"
+            "\n"
+            "示例：\n"
+            "  cd E:\\path\\to\\project && python claude_watcher_refactored.py\n"
+            "  python claude_watcher_refactored.py --project E:\\path\\to\\project\n"
+            "  python claude_watcher_refactored.py -t task_prompt_20260911_01.md\n"
+            "  python claude_watcher_refactored.py --list-tasks\n"
+        ),
+    )
+
+    parser.add_argument(
+        "-p", "--project",
+        help="目标项目目录（默认：当前工作目录）",
+    )
+    parser.add_argument(
+        "-t", "--task",
+        help=(
+            "任务 prompt 文件：完整路径、watching 目录内的文件名，"
+            "或它们的唯一主干名"
+        ),
+    )
+    parser.add_argument(
+        "--list-tasks",
+        action="store_true",
+        help="列出可自动发现的任务文件后退出（不启动 watcher）",
+    )
+    parser.add_argument(
+        "--claude-command",
+        help="Claude CLI 命令名或路径（默认：claude）",
+    )
+    parser.add_argument(
+        "--max-turns", type=int,
+        help="单轮 Claude 的最大 turns（默认：50）",
+    )
+    parser.add_argument(
+        "--model",
+        help="DeepSeek 模型名（默认：deepseek-flash）",
+    )
+    parser.add_argument(
+        "--min-confidence", type=float, dest="min_confidence",
+        help="判定任务完成的置信度门槛（默认：0.90）",
+    )
+    parser.add_argument(
+        "--idle-kill-seconds", type=int,
+        help="多少秒收不到事件就强杀 Claude（默认：600）",
+    )
+    parser.add_argument(
+        "--base-delay", type=float,
+        help="失败重试的基础退避秒数（默认：10）",
+    )
+    parser.add_argument(
+        "--max-delay", type=float,
+        help="退避上限秒数（默认：300）",
+    )
+    parser.add_argument(
+        "--max-consecutive-failures", type=int,
+        help="同一 session 连续失败多少次后丢弃重开（默认：8）",
+    )
+    parser.add_argument(
+        "--stuck-rounds", type=int,
+        help="连续多少轮 git 状态无变化判定为原地打转（默认：3）",
+    )
+
+    return parser
+
+
+def resolve_project_dir(args: argparse.Namespace) -> Path:
+    """解析目标项目目录：命令行 > 环境变量 > 当前工作目录。"""
+    raw = (
+        args.project
+        or os.environ.get(ENV_PROJECT)
+        or str(Path.cwd())
+    )
+
+    project_dir = Path(raw).expanduser()
+
+    if not project_dir.is_dir():
+        raise ConfigError(
+            f"目标项目目录不存在: {project_dir}\n"
+            "用 --project 指定，或先 cd 到目标项目再运行。"
+        )
+
+    return project_dir.resolve()
+
+
+def find_task_prompt_file(
+    watching_dir: Path,
+) -> tuple[Optional[Path], list[Path]]:
+    """在 watching 目录里挑选任务 prompt 文件。
+
+    返回 (选中的文件, 全部候选)。选不中时返回 (None, 候选列表)，
+    由调用方给出可操作的错误信息。
+    """
+    if not watching_dir.is_dir():
+        return None, []
+
+    pinned = watching_dir / PINNED_TASK_NAME
+
+    if pinned.is_file():
+        return pinned, [pinned]
+
+    candidates = sorted(
+        (p for p in watching_dir.glob(TASK_GLOB) if p.is_file()),
+        key=lambda p: p.name,
+    )
+
+    if not candidates:
+        return None, []
+
+    return candidates[-1], candidates
+
+
+def describe_candidates(
+    candidates: list[Path],
+    watching_dir: Path,
+) -> str:
+    """把候选任务文件渲染成可操作的提示。"""
+    if not candidates:
+        return (
+            f"  （{watching_dir} 下没有匹配 {TASK_GLOB} 的文件）\n"
+            "  请先创建任务文件，或用 --task 指定一个已存在的文件。"
+        )
+
+    lines = ["  按字典序（即时间序）排列的候选："]
+    lines += [f"    - {p.name}" for p in candidates]
+    lines.append(
+        f"  用 --task 指定，例如：--task {candidates[-1].name}"
+    )
+    return "\n".join(lines)
+
+
+def resolve_task_file(
+    project_dir: Path,
+    task_arg: Optional[str],
+) -> Path:
+    """把 --task 的值解析成实际文件路径。
+
+    支持三种写法：完整/相对路径、watching 目录内的文件名、唯一主干名。
+    """
+    watching_dir = project_dir / WATCHING_SUBDIR
+
+    if task_arg:
+        raw = Path(task_arg).expanduser()
+
+        if raw.is_file():
+            return raw.resolve()
+
+        if not raw.is_absolute():
+            inside = watching_dir / task_arg
+
+            if inside.is_file():
+                return inside.resolve()
+
+            matched = sorted(
+                p for p in watching_dir.glob(TASK_GLOB)
+                if p.stem == task_arg or p.name == task_arg
+            )
+
+            if len(matched) == 1:
+                return matched[0].resolve()
+
+        _, candidates = find_task_prompt_file(watching_dir)
+
+        raise ConfigError(
+            f"找不到任务 prompt: {task_arg}\n"
+            + describe_candidates(candidates, watching_dir)
+        )
+
+    chosen, candidates = find_task_prompt_file(watching_dir)
+
+    if chosen is None:
+        raise ConfigError(
+            f"在 {watching_dir} 下没有找到任务 prompt 文件。\n"
+            + describe_candidates(candidates, watching_dir)
+        )
+
+    return chosen.resolve()
+
+
+def resolve_config(args: argparse.Namespace) -> Config:
+    """按 命令行 > 环境变量 > 默认值 解析出 Config。"""
+    project_dir = resolve_project_dir(args)
+
+    task_arg = args.task or os.environ.get(ENV_TASK) or None
+    task_prompt_file = resolve_task_file(project_dir, task_arg)
+
+    overrides: dict[str, Any] = {}
+
+    claude_command = args.claude_command
+    if claude_command:
+        overrides["claude_command"] = claude_command
+
+    model = args.model or os.environ.get(ENV_MODEL)
+    if model:
+        overrides["deepseek_model"] = model
+
+    for arg_name, field_name in (
+        ("max_turns", "claude_max_turns"),
+        ("min_confidence", "deepseek_min_confidence"),
+        ("idle_kill_seconds", "idle_kill_seconds"),
+        ("base_delay", "base_delay"),
+        ("max_delay", "max_delay"),
+        ("max_consecutive_failures", "max_consecutive_failures"),
+        ("stuck_rounds", "stuck_rounds"),
+    ):
+        value = getattr(args, arg_name)
+
+        if value is not None:
+            overrides[field_name] = value
+
+    return Config(
+        project_dir=project_dir,
+        task_prompt_file=task_prompt_file,
+        **overrides,
+    )
+
+
+def list_tasks(project_dir: Path) -> int:
+    """实现 --list-tasks：只依赖项目目录，不要求任务文件存在。"""
+    watching_dir = project_dir / WATCHING_SUBDIR
+    chosen, candidates = find_task_prompt_file(watching_dir)
+
+    print(f"目标项目: {project_dir}")
+    print(f"任务目录: {watching_dir}")
+
+    if not candidates:
+        print(f"  （没有匹配 {TASK_GLOB} 的文件）")
+        return 1
+
+    for path in candidates:
+        mark = "   <- 默认选中" if path == chosen else ""
+        print(f"  {path.name}{mark}")
+
+    return 0
 
 
 # ============================================================
@@ -120,9 +416,13 @@ def log(message: str) -> None:
     except Exception:
         pass
 
+    # 配置尚未建立时（--list-tasks、--help、解析失败）只打印，不落盘。
+    if CONFIG is None:
+        return
+
     try:
-        WATCHING_DIR.mkdir(parents=True, exist_ok=True)
-        with WATCHER_LOG_FILE.open("a", encoding="utf-8") as f:
+        CONFIG.watching_dir.mkdir(parents=True, exist_ok=True)
+        with CONFIG.watcher_log_file.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -157,24 +457,25 @@ except Exception:
 # ============================================================
 
 def ensure_directories() -> None:
-    WATCHING_DIR.mkdir(parents=True, exist_ok=True)
-    STREAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG.watching_dir.mkdir(parents=True, exist_ok=True)
+    CONFIG.stream_log_dir.mkdir(parents=True, exist_ok=True)
 
 
 def load_task_prompt() -> str:
-    if not TASK_PROMPT_FILE.exists():
-        raise FileNotFoundError(
-            f"任务 prompt 不存在:\n{TASK_PROMPT_FILE}"
-        )
-    return TASK_PROMPT_FILE.read_text(encoding="utf-8")
+    path = CONFIG.task_prompt_file
+
+    if not path.exists():
+        raise FileNotFoundError(f"任务 prompt 不存在:\n{path}")
+
+    return path.read_text(encoding="utf-8")
 
 
 def load_session_id() -> Optional[str]:
-    if not SESSION_FILE.exists():
+    if CONFIG is None or not CONFIG.session_file.exists():
         return None
 
     try:
-        sid = SESSION_FILE.read_text(encoding="utf-8").strip()
+        sid = CONFIG.session_file.read_text(encoding="utf-8").strip()
         return sid or None
     except Exception as e:
         log(f"[Session] 读取失败: {e}")
@@ -182,20 +483,23 @@ def load_session_id() -> Optional[str]:
 
 
 def save_session_id(session_id: Optional[str]) -> None:
-    if not session_id:
+    if not session_id or CONFIG is None:
         return
 
     try:
-        WATCHING_DIR.mkdir(parents=True, exist_ok=True)
-        SESSION_FILE.write_text(session_id, encoding="utf-8")
+        CONFIG.watching_dir.mkdir(parents=True, exist_ok=True)
+        CONFIG.session_file.write_text(session_id, encoding="utf-8")
     except Exception as e:
         log(f"[Session] 保存失败: {e}")
 
 
 def clear_session_id() -> None:
+    if CONFIG is None:
+        return
+
     try:
-        if SESSION_FILE.exists():
-            SESSION_FILE.unlink()
+        if CONFIG.session_file.exists():
+            CONFIG.session_file.unlink()
         log("[Session] 已清除旧 session_id")
     except Exception as e:
         log(f"[Session] 清除失败: {e}")
@@ -487,7 +791,7 @@ def build_claude_command(
     prompt: str,
     session_id: Optional[str],
 ) -> list[str]:
-    cmd = [CLAUDE_COMMAND]
+    cmd = [CONFIG.claude_command]
 
     if session_id:
         cmd += ["--resume", session_id]
@@ -500,7 +804,7 @@ def build_claude_command(
         "--include-partial-messages",
         "--verbose",
         "--max-turns",
-        str(CLAUDE_MAX_TURNS),
+        str(CONFIG.claude_max_turns),
         "--dangerously-skip-permissions",
     ]
 
@@ -510,7 +814,7 @@ def build_claude_command(
 def create_stream_log_path() -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     random_part = random.randint(1000, 9999)
-    return STREAM_LOG_DIR / f"claude_{timestamp}_{random_part}.jsonl"
+    return CONFIG.stream_log_dir / f"claude_{timestamp}_{random_part}.jsonl"
 
 
 def terminate_process(proc: subprocess.Popen) -> None:
@@ -564,7 +868,7 @@ def run_claude_streaming(
     log(f"[Claude] 原始事件日志: {stream_log_path.name}")
 
     try:
-        claude_path = shutil.which(CLAUDE_COMMAND) or CLAUDE_COMMAND
+        claude_path = shutil.which(CONFIG.claude_command) or CONFIG.claude_command
 
         proc = subprocess.Popen(
             [claude_path] + cmd[1:],
@@ -573,7 +877,7 @@ def run_claude_streaming(
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=str(PROJECT_DIR),
+            cwd=str(CONFIG.project_dir),
             shell=False,
             bufsize=1,
         )
@@ -659,7 +963,7 @@ def run_claude_streaming(
                 idle = time.time() - execution.last_event_time
 
                 if (
-                    idle >= IDLE_WARNING_SECONDS
+                    idle >= CONFIG.idle_warning_seconds
                     and not execution.idle_warning_sent
                 ):
                     execution.idle_warning_sent = True
@@ -669,10 +973,10 @@ def run_claude_streaming(
                         f"last={execution.last_event_description or 'unknown'}"
                     )
 
-                if idle >= IDLE_KILL_SECONDS:
+                if idle >= CONFIG.idle_kill_seconds:
                     log(
                         "[Claude WATCHDOG] "
-                        f"超过 {IDLE_KILL_SECONDS}s 无事件，"
+                        f"超过 {CONFIG.idle_kill_seconds}s 无事件，"
                         "终止 Claude 进程"
                     )
                     terminate_process(proc)
@@ -722,7 +1026,7 @@ def run_git(args: list[str]) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=str(PROJECT_DIR),
+            cwd=str(CONFIG.project_dir),
             shell=False,
             timeout=30,
         )
@@ -913,7 +1217,7 @@ def ask_deepseek(
     client = OpenAI(
         api_key=api_key,
         base_url="https://api.deepseek.com",
-        timeout=DEEPSEEK_TIMEOUT,
+        timeout=CONFIG.deepseek_timeout,
     )
 
     execution_summary = build_execution_summary(execution)
@@ -941,7 +1245,7 @@ def ask_deepseek(
     try:
         response = (
             client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
+                model=CONFIG.deepseek_model,
                 messages=[
                     {
                         "role": "system",
@@ -1041,8 +1345,8 @@ def classify_execution_failure(
 
 
 def failure_backoff(delay: float) -> float:
-    sleep_time = min(delay, MAX_DELAY) * (
-        1 + random.uniform(-JITTER, JITTER)
+    sleep_time = min(delay, CONFIG.max_delay) * (
+        1 + random.uniform(-CONFIG.jitter, CONFIG.jitter)
     )
 
     log(
@@ -1057,8 +1361,8 @@ def failure_backoff(delay: float) -> float:
         time.sleep(min(1.0, end_time - time.time()))
 
     return min(
-        delay * BACKOFF_FACTOR,
-        MAX_DELAY,
+        delay * CONFIG.backoff_factor,
+        CONFIG.max_delay,
     )
 
 
@@ -1225,7 +1529,7 @@ def run_round(
     if (
         verdict.get("done", False)
         and verdict.get("confidence", 0.0)
-        >= DEEPSEEK_MIN_CONFIDENCE
+        >= CONFIG.deepseek_min_confidence
     ):
         log("")
         log("=" * 70)
@@ -1279,32 +1583,45 @@ def run_round(
 # Main
 # ============================================================
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
+    global CONFIG
+
     # 兜底：import 之后 stdout 仍可能被替换（重定向、外层包装器），再设一次。
     configure_stdout()
-    ensure_directories()
 
-    if not PROJECT_DIR.exists():
-        log(
-            f"[FATAL] 项目目录不存在: {PROJECT_DIR}"
-        )
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    # --list-tasks 只依赖项目目录，不要求任务文件已经存在。
+    if args.list_tasks:
+        try:
+            return list_tasks(resolve_project_dir(args))
+        except ConfigError as e:
+            log(f"[FATAL] {e}")
+            return 1
+
+    try:
+        CONFIG = resolve_config(args)
+    except ConfigError as e:
+        log(f"[FATAL] {e}")
         return 1
 
-    if not TASK_PROMPT_FILE.exists():
-        log(
-            f"[FATAL] Task prompt 不存在: "
-            f"{TASK_PROMPT_FILE}"
-        )
-        return 1
+    log("[启动] 本次生效配置")
+    log(f"[启动]   目标项目: {CONFIG.project_dir}")
+    log(f"[启动]   任务文件: {CONFIG.task_prompt_file}")
+    log(f"[启动]   状态目录: {CONFIG.watching_dir}")
 
     # 启动前检查 claude 命令是否存在。
     # 这不是网络检测，只是本机 CLI 检查。
-    if shutil.which(CLAUDE_COMMAND) is None:
+    if shutil.which(CONFIG.claude_command) is None:
         log(
-            "[FATAL] 找不到 claude CLI。"
-            "请确认 claude 已加入 PATH。"
+            "[FATAL] 找不到 claude CLI: "
+            f"{CONFIG.claude_command}\n"
+            "请确认它已加入 PATH，或用 --claude-command 指定。"
         )
         return 1
+
+    ensure_directories()
 
     task_prompt = load_task_prompt()
     session_id = load_session_id()
@@ -1323,7 +1640,7 @@ def main() -> int:
         )
 
     next_prompt = task_prompt
-    task_fail_delay = BASE_DELAY
+    task_fail_delay = CONFIG.base_delay
     consecutive_failures = 0
 
     # 恢复一个上次中断留下的 session 时，本轮按“重试”对待：
@@ -1426,7 +1743,7 @@ def main() -> int:
 
             # 新 session 必须重新使用原始任务。
             next_prompt = task_prompt
-            task_fail_delay = BASE_DELAY
+            task_fail_delay = CONFIG.base_delay
             consecutive_failures = 0
 
             # 新 session 对已完成的工作一无所知，重复副作用的风险更高。
@@ -1452,7 +1769,7 @@ def main() -> int:
             # 退回原始任务 prompt 重新开一个干净 session。
             if (
                 session_id
-                and consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                and consecutive_failures >= CONFIG.max_consecutive_failures
             ):
                 log(
                     f"[Session] 同一 session 连续失败 "
@@ -1466,7 +1783,7 @@ def main() -> int:
 
                 # 新 session 必须重新使用原始任务。
                 next_prompt = task_prompt
-                task_fail_delay = BASE_DELAY
+                task_fail_delay = CONFIG.base_delay
 
             # 下一轮是“失败重试”而不是 DeepSeek 驱动的续跑：
             # 必须防止 Claude 把中断前已完成的工作重做一遍。
@@ -1485,7 +1802,7 @@ def main() -> int:
         # ----------------------------------------------------
 
         # 正常执行后，重置失败 backoff 与连续失败计数。
-        task_fail_delay = BASE_DELAY
+        task_fail_delay = CONFIG.base_delay
         consecutive_failures = 0
 
         # 本轮已经正常收到 Claude 的汇报，后续由 DeepSeek 的
@@ -1515,7 +1832,7 @@ def main() -> int:
 
         last_fingerprint = fingerprint
 
-        if stuck_rounds >= STUCK_ROUNDS:
+        if stuck_rounds >= CONFIG.stuck_rounds:
             log(
                 f"[WATCHER] 连续 {stuck_rounds} 轮 git 状态无任何变化"
                 f"（指纹 {str(fingerprint)[:8]}），判定为原地打转："
