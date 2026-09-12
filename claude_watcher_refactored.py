@@ -47,6 +47,11 @@ MAX_DELAY = 300
 BACKOFF_FACTOR = 2
 JITTER = 0.3
 
+# 同一个 session 连续失败达到该次数，即判定 session 不可用并丢弃重开。
+# 网络中断 / watchdog 强杀时 Claude 可能来不及输出 result 事件，
+# 此时 session_invalid 永远不会被置位，必须靠这个计数兜底恢复。
+MAX_CONSECUTIVE_FAILURES = 5
+
 # DeepSeek
 DEEPSEEK_MODEL = "deepseek-flash"
 DEEPSEEK_TIMEOUT = 120
@@ -1224,6 +1229,7 @@ def main() -> int:
 
     next_prompt = task_prompt
     task_fail_delay = BASE_DELAY
+    consecutive_failures = 0
     iteration = 0
 
     while not STOP_REQUESTED:
@@ -1286,6 +1292,7 @@ def main() -> int:
             # 新 session 必须重新使用原始任务。
             next_prompt = task_prompt
             task_fail_delay = BASE_DELAY
+            consecutive_failures = 0
 
             if STOP_REQUESTED:
                 break
@@ -1298,6 +1305,31 @@ def main() -> int:
         # ----------------------------------------------------
 
         if action == ROUND_FAILED:
+            consecutive_failures += 1
+
+            # 兜底恢复：网络中断、watchdog 强杀等情况下 Claude 来不及
+            # 输出 result 事件，session_invalid 不会被置位，仅靠结果文本
+            # 匹配永远清不掉可能已经损坏的 session，会一直 --resume 下去。
+            # 这里用连续失败次数兜底：达到阈值就丢弃 session，
+            # 退回原始任务 prompt 重新开一个干净 session。
+            if (
+                session_id
+                and consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+            ):
+                log(
+                    f"[Session] 同一 session 连续失败 "
+                    f"{consecutive_failures} 次，判定为不可用，"
+                    "丢弃后重开新 session"
+                )
+
+                clear_session_id()
+                session_id = None
+                consecutive_failures = 0
+
+                # 新 session 必须重新使用原始任务。
+                next_prompt = task_prompt
+                task_fail_delay = BASE_DELAY
+
             task_fail_delay = failure_backoff(task_fail_delay)
             continue
 
@@ -1305,8 +1337,9 @@ def main() -> int:
         # 本轮正常结束，任务尚未完成
         # ----------------------------------------------------
 
-        # 正常执行后，重置失败 backoff。
+        # 正常执行后，重置失败 backoff 与连续失败计数。
         task_fail_delay = BASE_DELAY
+        consecutive_failures = 0
 
     log("[WATCHER] 已停止")
     return 130
