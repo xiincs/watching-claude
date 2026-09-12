@@ -30,6 +30,7 @@
 - [目录结构](#目录结构)
 - [测试](#测试)
 - [设计取舍与已知限制](#设计取舍与已知限制)
+- [License](#license)
 
 ---
 
@@ -311,5 +312,4 @@ CW_MODULE=/tmp/old.py python tests/case_stop.py     # 应当 FAILED
 
 ## License
 
-尚未添加许可证文件。若你打算公开分发，请先补上 `LICENSE`
-（MIT / Apache-2.0 等），否则默认保留所有权利。
+[MIT](LICENSE) © 2026 xiincs
