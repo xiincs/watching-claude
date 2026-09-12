@@ -1128,6 +1128,10 @@ def run_round(
     跨轮状态也不会被改坏。
 
     返回 (action, session_id, next_prompt)。
+
+    注意：失败 / 停止分支返回的 prompt 就是本次收到的（可能带前缀的）
+    prompt，仅作为占位；main() 只在 ROUND_CONTINUE / ROUND_DONE 时才会
+    采用它，以免前缀在连续失败链路上逐轮叠加。
     """
     # 注意：这里故意没有 wait_for_network()。
     # Claude CLI 本身就是实际的网络 / API 健康检查。
@@ -1351,7 +1355,7 @@ def main() -> int:
             round_prompt = next_prompt
 
         try:
-            action, session_id, next_prompt = run_round(
+            action, session_id, returned_prompt = run_round(
                 prompt=round_prompt,
                 session_id=session_id,
                 task_prompt=task_prompt,
@@ -1371,6 +1375,14 @@ def main() -> int:
             log(traceback.format_exc())
             task_fail_delay = failure_backoff(task_fail_delay)
             continue
+
+        # next_prompt 必须始终保存“裸指令”（不含任何前缀）。
+        #
+        # 失败 / 停止时 run_round 返回的是它本次收到的 prompt，也就是
+        # 已经带上前缀的那一份；若直接采用，连续失败时前缀会被逐轮
+        # 叠加（238 -> 459 -> 680 ...），prompt 无限膨胀。
+        if action in (ROUND_CONTINUE, ROUND_DONE):
+            next_prompt = returned_prompt
 
         # ----------------------------------------------------
         # 停止请求：不作为失败处理，直接退出循环
