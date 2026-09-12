@@ -1,10 +1,23 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
-# watcher 自己产生的运行态文件（真实运行时位于目标项目的 .claude/watching/）
+# 测试沙箱（tests/ 运行时产生，可用 CW_TEST_SANDBOX 改到别处）
+.test-sandbox/
+
+# watcher 自身产生的运行态文件。
+# 注意：真实运行时这些文件写在“被监督项目”的 .claude/watching/ 下，
+# 不是在 watcher 自己的仓库里，这里只是防止误提交。
 *.log
 stream_logs/
 last_session_id.txt
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -116,8 +116,10 @@ class ConfigError(Exception):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    prog = Path(sys.argv[0]).name
+
     parser = argparse.ArgumentParser(
-        prog=Path(sys.argv[0]).name,
+        prog=prog,
         description="Claude Code 外部监工：自动续跑 + DeepSeek 验收",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -132,10 +134,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"  若存在 {PINNED_TASK_NAME} 则优先使用它。\n"
             "\n"
             "示例：\n"
-            "  cd E:\\path\\to\\project && python claude_watcher_refactored.py\n"
-            "  python claude_watcher_refactored.py --project E:\\path\\to\\project\n"
-            "  python claude_watcher_refactored.py -t task_prompt_20260911_01.md\n"
-            "  python claude_watcher_refactored.py --list-tasks\n"
+            f"  cd /path/to/project && python {prog}\n"
+            f"  python {prog} --project /path/to/project\n"
+            f"  python {prog} -t task_prompt_20260911_01.md\n"
+            f"  python {prog} --list-tasks\n"
         ),
     )
 
