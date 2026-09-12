@@ -1,5 +1,9 @@
 # watching-claude
 
+[![tests](https://github.com/xiincs/watching-claude/actions/workflows/tests.yml/badge.svg)](https://github.com/xiincs/watching-claude/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+
 **Claude Code 外部监工：让 Claude Code 持续干活，用 DeepSeek 当验收员判断是否收工。**
 
 它自己不做开发任务，而是驱动 Claude Code 反复执行，并在每一轮之后判断
