@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import queue
@@ -51,6 +52,10 @@ JITTER = 0.3
 # 网络中断 / watchdog 强杀时 Claude 可能来不及输出 result 事件，
 # 此时 session_invalid 永远不会被置位，必须靠这个计数兜底恢复。
 MAX_CONSECUTIVE_FAILURES = 5
+
+# 连续多少轮目标仓库 git 状态毫无变化，就判定为“原地打转”。
+# 注意：命中后只升级 prompt 做自诊断，绝不停止循环。
+STUCK_ROUNDS = 3
 
 # DeepSeek
 DEEPSEEK_MODEL = "deepseek-flash"
@@ -739,6 +744,31 @@ def get_git_log() -> str:
     return run_git(["log", "--oneline", "-10"])
 
 
+def get_progress_fingerprint() -> Optional[str]:
+    """返回目标仓库“工作进度”的指纹，用于判断 watcher 是否原地打转。
+
+    指纹由 HEAD commit、工作区改动、最近一次提交时间组成；
+    三者都相同说明这一轮没有产生任何实际进展。
+
+    目标目录不是 git 仓库、或 git 不可用时返回 None，调用方应放弃
+    卡死判定（宁可不判定，也不要误判触发无意义的自诊断）。
+    """
+    inside = run_git(["rev-parse", "--is-inside-work-tree"]).strip()
+
+    if inside != "true":
+        return None
+
+    head = run_git(["rev-parse", "HEAD"])
+    status = run_git(["status", "--porcelain"])
+    stamp = run_git(["log", "-1", "--format=%ct"])
+
+    raw = f"{head}\n{status}\n{stamp}"
+
+    return hashlib.sha1(
+        raw.encode("utf-8", "replace")
+    ).hexdigest()
+
+
 # ============================================================
 # DeepSeek context
 # ============================================================
@@ -1065,6 +1095,25 @@ RETRY_GUARD_PROMPT = (
     "不要再做任何改动。"
 )
 
+# 检测到“原地打转”时附加的自诊断前缀。
+#
+# 为什么需要它：判据严格（done 且 confidence >= 0.90）配上不限轮次，
+# 有可能出现任务其实已完成、但 DeepSeek 始终不给 0.90 的情况，循环
+# 于是退化成通用 continuation prompt 反复空转。这里的处理不是停止
+# 循环（无人值守必须一直跑下去），而是把空转变成一次有产出的自诊断。
+STUCK_ESCALATION_PROMPT = (
+    "【重要：检测到执行停滞，请先诊断而不是重复劳动】\n"
+    "最近若干轮执行之后，目标仓库的 git 状态（HEAD、工作区改动、"
+    "提交时间）完全没有变化，说明这些轮次没有产生任何实际进展。\n"
+    "请按顺序完成：\n"
+    "1) 明确列出当前任务的完成度：哪些步骤已经做完、哪些还没开始；\n"
+    "2) 说明卡住的具体原因（缺依赖、命令失败、权限、网络、"
+    "等待外部流程等），并给出实际执行过的命令与输出作为证据；\n"
+    "3) 只推进「下一件真正能推进任务的事」，并实际动手执行它。\n"
+    "不要重复已经成功完成的步骤，也不要只是再一次声明任务状态。\n"
+    "如果你确认任务其实已经全部完成，请直接说明完成并给出证据。"
+)
+
 
 def run_round(
     prompt: str,
@@ -1257,6 +1306,11 @@ def main() -> int:
     # 上次会话在未知进度上被打断，直接重复原任务极易造成重复副作用。
     retry_after_failure = bool(session_id)
 
+    # 原地打转检测
+    last_fingerprint: Optional[str] = None
+    stuck_rounds = 0
+    escalate_next_round = False
+
     iteration = 0
 
     while not STOP_REQUESTED:
@@ -1267,12 +1321,20 @@ def main() -> int:
         log(f"[WATCHER] 第 {iteration} 轮")
         log("=" * 70)
 
-        # 失败重试 / 恢复中断会话时，附加保护前缀，避免重复副作用。
-        # 注意 next_prompt 本身不含前缀，因此不会逐轮累积。
-        round_prompt = next_prompt
+        # 按需为下一轮附加前缀。next_prompt 本身不含任何前缀，
+        # 因此长失败链路上不会逐轮累积。
+        prefixes: list[str] = []
 
         if retry_after_failure:
-            round_prompt = RETRY_GUARD_PROMPT + "\n\n" + next_prompt
+            prefixes.append(RETRY_GUARD_PROMPT)
+
+        if escalate_next_round:
+            prefixes.append(STUCK_ESCALATION_PROMPT)
+
+        if prefixes:
+            round_prompt = "\n\n".join(prefixes) + "\n\n" + next_prompt
+        else:
+            round_prompt = next_prompt
 
         try:
             action, session_id, next_prompt = run_round(
@@ -1390,6 +1452,40 @@ def main() -> int:
         # 本轮已经正常收到 Claude 的汇报，后续由 DeepSeek 的
         # next_prompt 驱动，不再需要重复动作保护。
         retry_after_failure = False
+
+        # ----------------------------------------------------
+        # 原地打转检测
+        #
+        # 判据严格（done 且 confidence >= 0.90）配上不限轮次，可能
+        # 出现“事实已完成但 DeepSeek 始终不给 0.90”而反复空转的情况。
+        # 处理方式不是停止循环（无人值守必须一直跑），而是把空转变
+        # 成一次有产出的自诊断。
+        # ----------------------------------------------------
+
+        fingerprint = get_progress_fingerprint()
+
+        if fingerprint is None:
+            # 拿不到指纹（目标目录不是 git 仓库、git 不可用等），
+            # 放弃卡死判定，避免误判。
+            stuck_rounds = 0
+            escalate_next_round = False
+        elif fingerprint == last_fingerprint:
+            stuck_rounds += 1
+        else:
+            stuck_rounds = 0
+
+        last_fingerprint = fingerprint
+
+        if stuck_rounds >= STUCK_ROUNDS:
+            log(
+                f"[WATCHER] 连续 {stuck_rounds} 轮 git 状态无任何变化"
+                f"（指纹 {str(fingerprint)[:8]}），判定为原地打转："
+                "下一轮附加自诊断指令（循环继续，不停止）"
+            )
+            escalate_next_round = True
+            stuck_rounds = 0
+        else:
+            escalate_next_round = False
 
     log("[WATCHER] 已停止")
     return 130
