@@ -1047,6 +1047,24 @@ DEFAULT_CONTINUATION_PROMPT = (
     "如果任务已经真正完成，请明确说明完成。"
 )
 
+# 失败重试 / 恢复中断会话时附加在 prompt 前面的保护前缀。
+#
+# 为什么需要它：Claude 可能已经把工作做完，却在汇报之前因网络中断、
+# watchdog 强杀或进程异常而退出。此时直接重复下达同一条指令，会让它
+# 把已经完成的动作再做一遍——在这类“改版本号 + 打 tag + 发 Release”
+# 的任务上，重复副作用是不可逆的（重复 bump、tag 冲突、重复发版）。
+RETRY_GUARD_PROMPT = (
+    "【重要：本轮是中断后的恢复执行，可能已有部分工作完成】\n"
+    "在动手之前，必须先检查仓库与产物的真实状态：\n"
+    "git status、git log --oneline -10、git tag、已有的 Release、"
+    "以及版本号文件的实际取值。\n"
+    "严禁重复执行已经完成的动作，尤其是：\n"
+    "不要重复提升版本号；不要重复创建已存在的 tag；"
+    "不要重复发布已存在的 Release。\n"
+    "如果检查后发现任务其实已经全部完成，请直接明确说明完成，"
+    "不要再做任何改动。"
+)
+
 
 def run_round(
     prompt: str,
@@ -1222,6 +1240,10 @@ def main() -> int:
         log(
             f"[启动] 使用已有 session: {session_id}"
         )
+        log(
+            "[启动] 该 session 来自上次中断，"
+            "首轮将附加防止重复动作的保护前缀"
+        )
     else:
         log(
             "[启动] 没有旧 session，将创建新 session"
@@ -1230,6 +1252,11 @@ def main() -> int:
     next_prompt = task_prompt
     task_fail_delay = BASE_DELAY
     consecutive_failures = 0
+
+    # 恢复一个上次中断留下的 session 时，本轮按“重试”对待：
+    # 上次会话在未知进度上被打断，直接重复原任务极易造成重复副作用。
+    retry_after_failure = bool(session_id)
+
     iteration = 0
 
     while not STOP_REQUESTED:
@@ -1240,9 +1267,16 @@ def main() -> int:
         log(f"[WATCHER] 第 {iteration} 轮")
         log("=" * 70)
 
+        # 失败重试 / 恢复中断会话时，附加保护前缀，避免重复副作用。
+        # 注意 next_prompt 本身不含前缀，因此不会逐轮累积。
+        round_prompt = next_prompt
+
+        if retry_after_failure:
+            round_prompt = RETRY_GUARD_PROMPT + "\n\n" + next_prompt
+
         try:
             action, session_id, next_prompt = run_round(
-                prompt=next_prompt,
+                prompt=round_prompt,
                 session_id=session_id,
                 task_prompt=task_prompt,
             )
@@ -1294,6 +1328,9 @@ def main() -> int:
             task_fail_delay = BASE_DELAY
             consecutive_failures = 0
 
+            # 新 session 对已完成的工作一无所知，重复副作用的风险更高。
+            retry_after_failure = True
+
             if STOP_REQUESTED:
                 break
 
@@ -1330,6 +1367,15 @@ def main() -> int:
                 next_prompt = task_prompt
                 task_fail_delay = BASE_DELAY
 
+            # 下一轮是“失败重试”而不是 DeepSeek 驱动的续跑：
+            # 必须防止 Claude 把中断前已完成的工作重做一遍。
+            retry_after_failure = True
+
+            log(
+                "[WATCHER] 下一轮为失败重试，"
+                "将附加“先检查状态、禁止重复动作”的保护前缀"
+            )
+
             task_fail_delay = failure_backoff(task_fail_delay)
             continue
 
@@ -1340,6 +1386,10 @@ def main() -> int:
         # 正常执行后，重置失败 backoff 与连续失败计数。
         task_fail_delay = BASE_DELAY
         consecutive_failures = 0
+
+        # 本轮已经正常收到 Claude 的汇报，后续由 DeepSeek 的
+        # next_prompt 驱动，不再需要重复动作保护。
+        retry_after_failure = False
 
     log("[WATCHER] 已停止")
     return 130
