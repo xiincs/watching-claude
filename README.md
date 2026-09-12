@@ -112,3 +112,61 @@
 > **Claude Code 自动续跑 + DeepSeek 验收的任务监工（Supervisor）**
 
 它解决的主要问题是：**Claude Code 一轮执行结束后，不需要你人工判断“做完了吗、下一步是什么”，脚本自动判断并继续推进。**
+
+---
+
+## 无人值守可靠性机制
+
+设计前提：**无限循环是需求**。因为 Claude 侧的网络不稳定，所以循环不设轮次上限。
+在这个前提下，风险不是“跑太多轮”，而是另外两件事：
+
+1. **循环不收敛** —— 看起来一直在跑，实际零进展；
+2. **监工自己死掉** —— 无人值守时进程退出且无人知晓。
+
+下面这些机制都是围绕这两点，且都不削弱无限循环。
+
+### 机制一览
+
+| 机制 | 位置 / 配置 | 行为 |
+| --- | --- | --- |
+| stdout 强制 UTF-8 | `configure_stdout()` | 重定向输出时 Windows 会用 gbk，打印 emoji 会抛 `UnicodeEncodeError`，进而强杀本轮 Claude。现在强制 UTF-8 + `errors="replace"`，`log()`/`log_raw()` 的 print 另有异常保护 |
+| 单轮异常隔离 | `main()` 的 try/except + `run_round()` | 任何未预期异常只影响一轮：记录类型与 traceback、退避、继续，绝不 `sys.exit` |
+| session 自愈 | `MAX_CONSECUTIVE_FAILURES = 8` | 网络中断/被强杀时 Claude 来不及输出 `result` 事件，光靠文本匹配清不掉坏 session。现在用连续失败计数兜底：达到阈值就丢弃 session、退回原始任务重开 |
+| 重试语义保护 | `RETRY_GUARD_PROMPT` | 失败重试、或恢复上次中断留下的 session 时，自动附加“先检查 git status / tag / Release，禁止重复 bump 版本、重复打 tag、重复发版”的前缀 |
+| 原地打转检测 | `STUCK_ROUNDS = 3` + `STUCK_ESCALATION_PROMPT` | 连续 N 轮 git 指纹（HEAD + 工作区 + 提交时间）完全不变，判定为停滞，下一轮附加自诊断指令。**只升级 prompt，不停止循环** |
+| 停止不误报 | `ROUND_STOPPED` | Ctrl+C 会让进程退出码为 1，以前会被记成 `PROCESS_FAILURE` 并打印退避，误导事后复盘；现在识别为“被打断”而非失败 |
+
+### 退出码语义
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | DeepSeek 判定 `done=true` 且 `confidence >= 0.90`，任务确认完成 |
+| `1` | 启动前置检查失败（项目目录 / 任务 prompt / claude CLI 缺失） |
+| `2` | Claude 认证失败（需要先 `/login`） |
+| `130` | 收到停止请求（Ctrl+C / SIGTERM） |
+
+### 关键配置
+
+```python
+PROJECT_DIR              # 被监督的项目目录
+TASK_PROMPT_FILE         # 任务 prompt 文件
+CLAUDE_MAX_TURNS = 50    # 单轮最大 turns
+IDLE_WARNING_SECONDS = 180   # 无事件告警阈值
+IDLE_KILL_SECONDS = 600      # 无事件强杀阈值（网络卡死时的解套手段）
+BASE_DELAY / MAX_DELAY / BACKOFF_FACTOR / JITTER   # 失败退避
+MAX_CONSECUTIVE_FAILURES = 8 # 连续失败多少次后丢弃 session
+STUCK_ROUNDS = 3             # 连续多少轮无 git 变化判定为停滞
+DEEPSEEK_MIN_CONFIDENCE = 0.90   # 判定完成的置信度门槛
+```
+
+### 运行前提
+
+- 环境变量 `DEEPSEEK_API_KEY`（注意：设在 User 作用域后需要**新开终端**才能读到）
+- `claude` CLI 在 PATH 中
+- 目标项目下存在任务 prompt 文件
+
+### 维护提醒
+
+`ask_deepseek()` 使用 `response_format={"type": "json_object"}`，而 DeepSeek 要求
+prompt 中必须出现 “json” 字样，否则直接 400。当前 `DEEPSEEK_SYSTEM_PROMPT` 结尾的
+“只输出 JSON：”正好满足该要求——**改写 system prompt 时不要删掉这句**。
