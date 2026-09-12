@@ -1066,6 +1066,7 @@ ROUND_FAILED = "failed"                      # Claude 本轮失败，可退避�
 ROUND_SESSION_INVALID = "session_invalid"    # session 不可用，需清除后重开
 ROUND_DONE = "done"                          # 任务确认完成
 ROUND_FATAL = "fatal"                        # 不可恢复（例如认证失败）
+ROUND_STOPPED = "stopped"                    # 因停止请求（Ctrl+C）中断，非失败
 
 # DeepSeek 未给出 next_prompt 时的保守兜底指令。
 DEFAULT_CONTINUATION_PROMPT = (
@@ -1138,6 +1139,19 @@ def run_round(
     if execution.session_id:
         session_id = execution.session_id
         save_session_id(session_id)
+
+    # --------------------------------------------------------
+    # 停止请求
+    #
+    # 收到 Ctrl+C / SIGTERM 时 run_claude_streaming 会强杀 Claude，
+    # 进程退出码必然是 1。这是“被打断”，不是“执行失败”：
+    # 若按失败处理，日志会留下一条假的 PROCESS_FAILURE 和退避重试，
+    # 事后复盘会把一次正常的人工停止误读成故障。
+    # --------------------------------------------------------
+
+    if STOP_REQUESTED:
+        log("[Claude] 本轮因停止请求中断，不计入失败")
+        return ROUND_STOPPED, session_id, prompt
 
     # --------------------------------------------------------
     # 认证失败
@@ -1357,6 +1371,13 @@ def main() -> int:
             log(traceback.format_exc())
             task_fail_delay = failure_backoff(task_fail_delay)
             continue
+
+        # ----------------------------------------------------
+        # 停止请求：不作为失败处理，直接退出循环
+        # ----------------------------------------------------
+
+        if action == ROUND_STOPPED:
+            break
 
         # ----------------------------------------------------
         # 不可恢复：认证失败等
