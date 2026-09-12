@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1021,6 +1022,164 @@ def failure_backoff(delay: float) -> float:
 
 
 # ============================================================
+# 单轮执行
+# ============================================================
+
+# run_round() 的返回值：把控制流交回 main()，由 main() 独占跨轮状态。
+ROUND_CONTINUE = "continue"                  # 本轮正常结束，任务尚未完成
+ROUND_FAILED = "failed"                      # Claude 本轮失败，可退避重试
+ROUND_SESSION_INVALID = "session_invalid"    # session 不可用，需清除后重开
+ROUND_DONE = "done"                          # 任务确认完成
+ROUND_FATAL = "fatal"                        # 不可恢复（例如认证失败）
+
+# DeepSeek 未给出 next_prompt 时的保守兜底指令。
+DEFAULT_CONTINUATION_PROMPT = (
+    "继续检查当前任务进度。"
+    "请读取当前工作区状态，"
+    "结合之前已经完成的工作，"
+    "继续执行尚未完成的任务。"
+    "不要重复已经成功完成的步骤。"
+    "如果任务已经真正完成，请明确说明完成。"
+)
+
+
+def run_round(
+    prompt: str,
+    session_id: Optional[str],
+    task_prompt: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """执行一轮：Claude 执行 → 必要时让 DeepSeek 判断。
+
+    本函数只负责“一轮”，不持有任何跨轮状态；退避、连续失败计数、
+    停止判定全部留在 main()。这样即使本函数抛出未预期异常，
+    跨轮状态也不会被改坏。
+
+    返回 (action, session_id, next_prompt)。
+    """
+    # 注意：这里故意没有 wait_for_network()。
+    # Claude CLI 本身就是实际的网络 / API 健康检查。
+    execution = run_claude_streaming(
+        prompt=prompt,
+        session_id=session_id,
+    )
+
+    if execution.session_id:
+        session_id = execution.session_id
+        save_session_id(session_id)
+
+    # --------------------------------------------------------
+    # 认证失败
+    # --------------------------------------------------------
+
+    if execution.auth_failed:
+        log(
+            "[FATAL] Claude 认证失败。"
+            "请在当前环境执行 /login 后再运行 watcher。"
+        )
+        return ROUND_FATAL, session_id, prompt
+
+    # --------------------------------------------------------
+    # session 无效
+    # --------------------------------------------------------
+
+    if execution.session_invalid:
+        return ROUND_SESSION_INVALID, session_id, prompt
+
+    # --------------------------------------------------------
+    # Claude 失败
+    # --------------------------------------------------------
+
+    failed = (
+        execution.returncode != 0
+        or execution.is_error
+        or execution.terminal_reason in (
+            "aborted_streaming",
+            "error",
+            "api_error",
+        )
+    )
+
+    if failed:
+        failure = classify_execution_failure(execution)
+
+        log(
+            f"[Claude FAILURE] "
+            f"type={failure}, "
+            f"returncode={execution.returncode}, "
+            f"terminal_reason={execution.terminal_reason}"
+        )
+
+        # 网络 / API 错误、进程错误等都交给实际 CLI 结果处理，
+        # 不再提前做一个独立的网络探测。
+        return ROUND_FAILED, session_id, prompt
+
+    # --------------------------------------------------------
+    # DeepSeek 判断
+    # --------------------------------------------------------
+
+    verdict = ask_deepseek(
+        task_prompt=task_prompt,
+        execution=execution,
+    )
+
+    # --------------------------------------------------------
+    # 完成判定
+    # --------------------------------------------------------
+
+    if (
+        verdict.get("done", False)
+        and verdict.get("confidence", 0.0)
+        >= DEEPSEEK_MIN_CONFIDENCE
+    ):
+        log("")
+        log("=" * 70)
+        log("✅ 任务确认完成")
+        log(
+            f"confidence="
+            f"{verdict.get('confidence', 0):.2f}"
+        )
+        log(
+            f"reason="
+            f"{verdict.get('reason', '')}"
+        )
+        log("=" * 70)
+        return ROUND_DONE, session_id, prompt
+
+    # --------------------------------------------------------
+    # 未完成：获取下一轮 prompt
+    # --------------------------------------------------------
+
+    candidate_prompt = str(
+        verdict.get("next_prompt", "")
+        or ""
+    ).strip()
+
+    if candidate_prompt:
+        preview = candidate_prompt.replace("\n", " ")
+
+        log("[WATCHER] DeepSeek 生成下一步 prompt:")
+        log(f"[WATCHER] {preview[:300]}")
+
+        next_prompt = candidate_prompt
+    else:
+        # DeepSeek 没有生成 next_prompt。
+        # 使用保守 continuation，不让 Claude 空转。
+        next_prompt = DEFAULT_CONTINUATION_PROMPT
+
+        log(
+            "[WATCHER] DeepSeek 未提供 next_prompt，"
+            "使用默认 continuation prompt"
+        )
+
+    log(
+        "[WATCHER] Claude 本轮正常结束，但任务尚未完成，"
+        "下一轮将使用 --resume"
+    )
+
+    return ROUND_CONTINUE, session_id, next_prompt
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1075,38 +1234,47 @@ def main() -> int:
         log(f"[WATCHER] 第 {iteration} 轮")
         log("=" * 70)
 
-        # ====================================================
-        # 注意：
-        # 这里故意没有 wait_for_network()。
-        #
-        # Claude CLI 本身就是实际的网络/API健康检查。
-        # ====================================================
-
-        execution = run_claude_streaming(
-            prompt=next_prompt,
-            session_id=session_id,
-        )
-
-        if execution.session_id:
-            session_id = execution.session_id
-            save_session_id(session_id)
-
-        # ----------------------------------------------------
-        # 认证失败
-        # ----------------------------------------------------
-
-        if execution.auth_failed:
-            log(
-                "[FATAL] Claude 认证失败。"
-                "请在当前环境执行 /login 后再运行 watcher。"
+        try:
+            action, session_id, next_prompt = run_round(
+                prompt=next_prompt,
+                session_id=session_id,
+                task_prompt=task_prompt,
             )
+
+        except KeyboardInterrupt:
+            log("[WATCHER] 收到 KeyboardInterrupt，停止")
+            break
+
+        except Exception as e:
+            # 无人值守下，任何未预期异常都只允许影响一轮：
+            # 记录、退避、继续，绝不让 watcher 自己退出。
+            log(
+                f"[WATCHER ERROR] 第 {iteration} 轮未预期异常: "
+                f"{type(e).__name__}: {e}"
+            )
+            log(traceback.format_exc())
+            task_fail_delay = failure_backoff(task_fail_delay)
+            continue
+
+        # ----------------------------------------------------
+        # 不可恢复：认证失败等
+        # ----------------------------------------------------
+
+        if action == ROUND_FATAL:
             return 2
+
+        # ----------------------------------------------------
+        # 任务完成
+        # ----------------------------------------------------
+
+        if action == ROUND_DONE:
+            return 0
 
         # ----------------------------------------------------
         # session 无效
         # ----------------------------------------------------
 
-        if execution.session_invalid:
+        if action == ROUND_SESSION_INVALID:
             log(
                 "[Session] 旧 session 无效，"
                 "清除后下一轮创建新 session"
@@ -1129,116 +1297,16 @@ def main() -> int:
         # Claude 失败
         # ----------------------------------------------------
 
-        failed = (
-            execution.returncode != 0
-            or execution.is_error
-            or execution.terminal_reason in (
-                "aborted_streaming",
-                "error",
-                "api_error",
-            )
-        )
-
-        if failed:
-            failure = classify_execution_failure(execution)
-
-            log(
-                f"[Claude FAILURE] "
-                f"type={failure}, "
-                f"returncode={execution.returncode}, "
-                f"terminal_reason={execution.terminal_reason}"
-            )
-
-            # 网络/API错误、进程错误等都交给实际 CLI 结果处理，
-            # 不再提前做一个独立的网络探测。
-            task_fail_delay = failure_backoff(
-                task_fail_delay
-            )
+        if action == ROUND_FAILED:
+            task_fail_delay = failure_backoff(task_fail_delay)
             continue
+
+        # ----------------------------------------------------
+        # 本轮正常结束，任务尚未完成
+        # ----------------------------------------------------
 
         # 正常执行后，重置失败 backoff。
         task_fail_delay = BASE_DELAY
-
-        # ----------------------------------------------------
-        # DeepSeek 判断
-        # ----------------------------------------------------
-
-        verdict = ask_deepseek(
-            task_prompt=task_prompt,
-            execution=execution,
-        )
-
-        # ----------------------------------------------------
-        # 完成判定
-        # ----------------------------------------------------
-
-        if (
-            verdict.get("done", False)
-            and verdict.get("confidence", 0.0)
-            >= DEEPSEEK_MIN_CONFIDENCE
-        ):
-            log("")
-            log("=" * 70)
-            log("✅ 任务确认完成")
-            log(
-                f"confidence="
-                f"{verdict.get('confidence', 0):.2f}"
-            )
-            log(
-                f"reason="
-                f"{verdict.get('reason', '')}"
-            )
-            log("=" * 70)
-            return 0
-
-        # ----------------------------------------------------
-        # 未完成：获取下一轮 prompt
-        # ----------------------------------------------------
-
-        candidate_prompt = str(
-            verdict.get("next_prompt", "")
-            or ""
-        ).strip()
-
-        if candidate_prompt:
-            next_prompt = candidate_prompt
-
-            preview = candidate_prompt.replace(
-                "\n",
-                " ",
-            )
-
-            log(
-                "[WATCHER] DeepSeek 生成下一步 prompt:"
-            )
-            log(
-                f"[WATCHER] {preview[:300]}"
-            )
-
-        else:
-            # DeepSeek 没有生成 next_prompt。
-            # 使用保守 continuation，不让 Claude 空转。
-            next_prompt = (
-                "继续检查当前任务进度。"
-                "请读取当前工作区状态，"
-                "结合之前已经完成的工作，"
-                "继续执行尚未完成的任务。"
-                "不要重复已经成功完成的步骤。"
-                "如果任务已经真正完成，请明确说明完成。"
-            )
-
-            log(
-                "[WATCHER] DeepSeek 未提供 next_prompt，"
-                "使用默认 continuation prompt"
-            )
-
-        if STOP_REQUESTED:
-            break
-
-        log(
-            "[WATCHER] Claude 本轮正常结束，但任务尚未完成，"
-            "下一轮将使用 --resume"
-        )
 
     log("[WATCHER] 已停止")
     return 130
