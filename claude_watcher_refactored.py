@@ -60,6 +60,35 @@ STOP_REQUESTED = False
 
 
 # ============================================================
+# stdout 编码
+# ============================================================
+
+def configure_stdout() -> None:
+    """把 stdout / stderr 强制为 UTF-8，并把编码失败降级为替换字符。
+
+    无人值守运行时 stdout 通常被重定向到文件或管道。Windows 下此时
+    Python 使用 ANSI 代码页（gbk/cp936）且 errors=surrogateescape，
+    打印 Claude 输出、工具结果里常见的 emoji（✅ ✔ ⚠）会抛
+    UnicodeEncodeError。
+
+    该异常会从事件处理中冒出来，导致本轮 Claude 进程被判定失败并强杀。
+    如果 Claude 每轮都在同一位置输出 emoji，watcher 就会永远卡在
+    “启动 → 被杀 → 重试”的循环里，永不收敛。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception:
+            pass
+
+
+configure_stdout()
+
+
+# ============================================================
 # 日志
 # ============================================================
 
@@ -67,7 +96,12 @@ def log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
 
-    print(line, flush=True)
+    # 打印失败（编码、管道断开、句柄被回收）绝不能影响主流程。
+    # 文件日志仍会写入完整内容。
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
 
     try:
         WATCHING_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,7 +112,10 @@ def log(message: str) -> None:
 
 
 def log_raw(message: str) -> None:
-    print(message, end="", flush=True)
+    try:
+        print(message, end="", flush=True)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -988,6 +1025,8 @@ def failure_backoff(delay: float) -> float:
 # ============================================================
 
 def main() -> int:
+    # 兜底：import 之后 stdout 仍可能被替换（重定向、外层包装器），再设一次。
+    configure_stdout()
     ensure_directories()
 
     if not PROJECT_DIR.exists():
