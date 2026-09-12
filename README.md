@@ -53,11 +53,12 @@
 
 1. 读取任务
 
-   - 从 `.claude/watching/task_prompt_20260911_01.md` 获取任务目标。
+   - 从目标项目下 `.claude/watching/` 里获取任务目标；具体用哪个文件由
+     运行时解析决定（详见下文「运行方式」与「任务文件自动发现」）。
 
 2. 启动 Claude Code
 
-   - 在项目目录 `E:\Project202608\dsh-desktop` 中运行 Claude。
+   - 在目标项目目录中运行 Claude（默认取当前工作目录，可用 `--project` 指定）。
    - 支持 `--resume`，因此可以继续之前的 Claude session。
    - 使用 `--dangerously-skip-permissions`，让 Claude 不需要人工逐项确认权限。
 
@@ -131,39 +132,84 @@
 | --- | --- | --- |
 | stdout 强制 UTF-8 | `configure_stdout()` | 重定向输出时 Windows 会用 gbk，打印 emoji 会抛 `UnicodeEncodeError`，进而强杀本轮 Claude。现在强制 UTF-8 + `errors="replace"`，`log()`/`log_raw()` 的 print 另有异常保护 |
 | 单轮异常隔离 | `main()` 的 try/except + `run_round()` | 任何未预期异常只影响一轮：记录类型与 traceback、退避、继续，绝不 `sys.exit` |
-| session 自愈 | `MAX_CONSECUTIVE_FAILURES = 8` | 网络中断/被强杀时 Claude 来不及输出 `result` 事件，光靠文本匹配清不掉坏 session。现在用连续失败计数兜底：达到阈值就丢弃 session、退回原始任务重开 |
+| session 自愈 | `--max-consecutive-failures`（默认 8） | 网络中断/被强杀时 Claude 来不及输出 `result` 事件，光靠文本匹配清不掉坏 session。现在用连续失败计数兜底：达到阈值就丢弃 session、退回原始任务重开 |
 | 重试语义保护 | `RETRY_GUARD_PROMPT` | 失败重试、或恢复上次中断留下的 session 时，自动附加“先检查 git status / tag / Release，禁止重复 bump 版本、重复打 tag、重复发版”的前缀 |
-| 原地打转检测 | `STUCK_ROUNDS = 3` + `STUCK_ESCALATION_PROMPT` | 连续 N 轮 git 指纹（HEAD + 工作区 + 提交时间）完全不变，判定为停滞，下一轮附加自诊断指令。**只升级 prompt，不停止循环** |
+| 原地打转检测 | `--stuck-rounds`（默认 3） + `STUCK_ESCALATION_PROMPT` | 连续 N 轮 git 指纹（HEAD + 工作区 + 提交时间）完全不变，判定为停滞，下一轮附加自诊断指令。**只升级 prompt，不停止循环** |
 | 停止不误报 | `ROUND_STOPPED` | Ctrl+C 会让进程退出码为 1，以前会被记成 `PROCESS_FAILURE` 并打印退避，误导事后复盘；现在识别为“被打断”而非失败 |
 
 ### 退出码语义
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | DeepSeek 判定 `done=true` 且 `confidence >= 0.90`，任务确认完成 |
-| `1` | 启动前置检查失败（项目目录 / 任务 prompt / claude CLI 缺失） |
+| `0` | DeepSeek 判定 `done=true` 且 `confidence >= min-confidence`（默认 0.90），任务确认完成；或 `--list-tasks` 正常列出 |
+| `1` | 配置无法解析（项目目录不存在、找不到任务文件），或 `claude` CLI 不在 PATH |
 | `2` | Claude 认证失败（需要先 `/login`） |
 | `130` | 收到停止请求（Ctrl+C / SIGTERM） |
 
-### 关键配置
+### 运行方式
 
-```python
-PROJECT_DIR              # 被监督的项目目录
-TASK_PROMPT_FILE         # 任务 prompt 文件
-CLAUDE_MAX_TURNS = 50    # 单轮最大 turns
-IDLE_WARNING_SECONDS = 180   # 无事件告警阈值
-IDLE_KILL_SECONDS = 600      # 无事件强杀阈值（网络卡死时的解套手段）
-BASE_DELAY / MAX_DELAY / BACKOFF_FACTOR / JITTER   # 失败退避
-MAX_CONSECUTIVE_FAILURES = 8 # 连续失败多少次后丢弃 session
-STUCK_ROUNDS = 3             # 连续多少轮无 git 变化判定为停滞
-DEEPSEEK_MIN_CONFIDENCE = 0.90   # 判定完成的置信度门槛
+目标项目与任务文件都不再写在代码里，运行时解析。优先级：
+**命令行 > 环境变量 > 默认值**。
+
+```bash
+# 最简：cd 到目标项目，任务文件自动发现
+cd E:\Project202608\dsh-desktop
+python E:\Projects202609\watching-claude\claude_watcher_refactored.py
+
+# 指定目标项目
+python claude_watcher_refactored.py --project E:\Project202608\dsh-desktop
+
+# 指定任务文件（完整路径 / 文件名 / 唯一主干名 都可以）
+python claude_watcher_refactored.py -t task_prompt_20260911_01.md
+python claude_watcher_refactored.py -t task_prompt_20260911_01
+
+# 看看有哪些任务文件可选（不启动 watcher）
+python claude_watcher_refactored.py --list-tasks
+
+# 全量参数
+python claude_watcher_refactored.py --help
 ```
+
+### 任务文件自动发现
+
+`<project>/.claude/watching/` 下的选择规则：
+
+1. 若存在 `task_prompt.md`（不带日期）→ **优先使用它**，用于把当前任务钉住；
+2. 否则取 `task_prompt*.md` 中**字典序最大**的一个。
+
+文件名形如 `task_prompt_20260911_01.md`，字典序即时间序，
+所以**换任务只需要新建一个任务文件，不必改任何代码**。
+
+### 环境变量
+
+| 变量 | 等价参数 | 说明 |
+| --- | --- | --- |
+| `WATCHER_PROJECT_DIR` | `--project` | 目标项目目录 |
+| `WATCHER_TASK_PROMPT` | `--task` | 任务 prompt 文件 |
+| `WATCHER_MODEL` | `--model` | DeepSeek 模型名 |
+| `DEEPSEEK_API_KEY` | — | DeepSeek 鉴权，必填 |
+
+### 可调参数
+
+全部集中在 `Config` dataclass 里，路径由 `project_dir` 派生，
+状态文件（`last_session_id.txt` / `stream_logs/` / `watcher.log`）位置
+只在 `Config` 的属性里定义一次。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--claude-command` | `claude` | Claude CLI 命令名或路径 |
+| `--max-turns` | 50 | 单轮最大 turns |
+| `--min-confidence` | 0.90 | 判定完成的置信度门槛 |
+| `--idle-kill-seconds` | 600 | 多少秒收不到事件就强杀 Claude（网络卡死的解套手段） |
+| `--base-delay` / `--max-delay` | 10 / 300 | 失败退避的起点与上限 |
+| `--max-consecutive-failures` | 8 | 连续失败多少次后丢弃 session |
+| `--stuck-rounds` | 3 | 连续多少轮无 git 变化判定为停滞 |
 
 ### 运行前提
 
 - 环境变量 `DEEPSEEK_API_KEY`（注意：设在 User 作用域后需要**新开终端**才能读到）
-- `claude` CLI 在 PATH 中
-- 目标项目下存在任务 prompt 文件
+- `claude` CLI 在 PATH 中（或用 `--claude-command` 指定）
+- 目标项目下存在任务 prompt 文件（可用 `--list-tasks` 确认）
 
 ### 维护提醒
 
