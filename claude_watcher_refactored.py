@@ -49,9 +49,15 @@ BACKOFF_FACTOR = 2
 JITTER = 0.3
 
 # 同一个 session 连续失败达到该次数，即判定 session 不可用并丢弃重开。
+#
 # 网络中断 / watchdog 强杀时 Claude 可能来不及输出 result 事件，
 # 此时 session_invalid 永远不会被置位，必须靠这个计数兜底恢复。
-MAX_CONSECUTIVE_FAILURES = 5
+#
+# 取值权衡：丢弃 session 会连带丢掉 Claude 对仓库的积累认知，下一轮
+# 需要重新摸索，因此不宜过于激进——纯粹的链路抖动并不会损坏 session。
+# 按退避序列（10/20/40/80/160/300...）估算，8 次约等于连续故障 20 分钟
+# 才会丢弃；这既能覆盖长时间断网，又能对真正损坏的 session 兜底。
+MAX_CONSECUTIVE_FAILURES = 8
 
 # 连续多少轮目标仓库 git 状态毫无变化，就判定为“原地打转”。
 # 注意：命中后只升级 prompt 做自诊断，绝不停止循环。
